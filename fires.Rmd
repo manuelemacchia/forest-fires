@@ -1,0 +1,1188 @@
+---
+title: "Predicting the area burned by forest fires with weather data"
+author: "Manuele Macchia"
+date: "September 2021"
+bibliography: bib.json
+link-citations: true
+output:
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_float: false
+    toc_collapsed: true
+    toc_depth: 4
+    theme: sandstone
+    number_sections: true
+    df_print: paged
+    css: style.css
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction
+Forest fires are a major environmental concern. Wildfires cause environmental and economical damage, destroy large areas of land and displace entire communities. Forest ecosystems could once easily bounce back from natural occurring fires. However, due to climate change, this is no longer the case, as longer periods of drought and rising temperatures do not allow forests to recover. Therefore, it is an increasingly important concern to prevent wildfires or, at least, limit the damage they cause by detecting their occurrence as soon as possible.
+
+Our goal is to **predict the burned area of forest fires**, measured in hectares (ha). There are various techniques to detect forest fires, such as satellite systems and infrared scanners. However, the deployment of these systems is costly and their response may be delayed by various factors. Another possibility is to analyze weather conditions such as humidity and temperature, which are known to affect fire occurrences. Unlike other systems, weather data may be easily collected in real time employing cheap sensors. We will use this kind of readily accessible data for our prediction task.
+
+```{r, message=FALSE}
+library(tidyverse)
+library(ggplot2)
+library(ggcorrplot)
+library(cowplot)
+library(tree)
+library(ranger)
+library(caret)
+
+# Load fires
+fires.data <- read.csv("data/forestfires.csv", header=T)
+
+# Set categorical variables as factors
+fires.data$X <- factor(fires.data$X)
+fires.data$Y <- factor(fires.data$Y)
+fires.data$month <- factor(fires.data$month, levels=c("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"))
+fires.data$day <- factor(fires.data$day, levels=c("mon", "tue", "wed", "thu", "fri", "sat", "sun"))
+
+# Settings for plots
+point_alpha <- 0.4
+line_color <- "brown3"
+```
+
+# Dataset
+The data consists of a collection of 517 records, each corresponding to a fire occurred in the Montesinho natural park, in the northeast region of Portugal, from January 2000 to December 2003. Each record presents 12 attributes, including spatial data, temporal data, information regarding weather conditions and weather indices. Additionally, each record contains the value of the area burned by the forest fire, which is our target for the regression task. The dataset does not contain any missing value.
+
+```{r}
+fires.data
+```
+
+## Source
+The dataset was created by @cortez by manually merging two datasets. The first one was provided by an inspector that was responsible for the Montesinho fire occurrences, who collected temporal data and spatial data for each fire, along with the components of the FWI system and the total burned area. The second one was collected by the Polytechnic Institute of Bragança, and contains several weather observations that were recorded within a 30 minute period by a meteorological station located at the center of the park.
+
+## Attributes
+The following table describes the dataset attributes.
+
+| Attribute     | Description                                              | Type                                |
+|---------------|----------------------------------------------------------|-------------------------------------|
+| X             | X-axis spatial coordinate within the Montesinho park map | Qualitative (factor) with 9 levels  |
+| Y             | Y-axis spatial coordinate within the Montesinho park map | Qualitative (factor) with 7 levels  |
+| month         | Month of the year                                        | Qualitative (factor) with 12 levels |
+| day           | Day of the week                                          | Qualitative (factor) with 7 levels  |
+| FFMC          | FFMC index from the FWI system                           | Quantitative                        |
+| DMC           | DMC index from the FWI system                            | Quantitative                        |
+| DC            | DC index from the FWI system                             | Quantitative                        |
+| ISI           | ISI index from the FWI system                            | Quantitative                        |
+| temp          | Temperature in Celsius degrees                           | Quantitative                        |
+| RH            | Relative humidity in %                                   | Quantitative                        |
+| wind          | Wind speed in km/h                                       | Quantitative                        |
+| rain          | Outside rain in mm/m²                                    | Quantitative                        |
+| area          | Burned area of forest in ha                          | Quantitative                        |
+
+## Training and testing
+Our goal is to build a model that is capable of predicting the burned area of forest fires, given a set of predictors. To test the generalization ability of our models, we hold out part of the available data as a test set. This set is useful to evaluate the prediction performance of a model on unseen data.
+
+To generate a test set, we randomly sample 20% of our dataset. The remaining 80% is regarded as the training set, i.e., the data we use to build and validate our models.
+
+```{r}
+train_nrow <- floor(0.8 * nrow(fires.data))
+
+set.seed(42)  # For reproducibility
+train_idx <- sample(seq_len(nrow(fires.data)), size=train_nrow)
+
+fires <- fires.data[train_idx, ]
+cat("Training set size:", nrow(fires))
+```
+
+```{r}
+fires.test <- fires.data[-train_idx, ]
+cat("Test set size:", nrow(fires.test))
+```
+
+Note that exploratory data analysis is performed exclusively on the training set, to avoid any information leakage during data preprocessing steps.
+
+## Exploratory data analysis
+
+### Spatial data
+The position of the fires is encoded into a 9 by 9 grid, superimposed over the Montesinho park map. The following heatmap shows how many fires occurred at each (X, Y) coordinate pair. It is evident, according to this data, that the position influences the probability of fire occurrence.
+
+```{r}
+coord_counts <- merge(as.data.frame(table(fires[, 1:2])), expand.grid(X=as.factor(c(1:9)), Y=as.factor(c(1:9))), by=c("X", "Y"), all=TRUE)
+
+ggplot() +
+  geom_raster(data=coord_counts, aes(x=X, y=Y, fill=Freq)) +
+  scale_fill_gradient(low="white", high="brown3", na.value = "white", name="Count") +
+  scale_x_discrete(position = "top") +
+  scale_y_discrete(limits=factor(9:1)) +
+  ggtitle("Frequency of fires in each zone") +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+### Burned area
+Our prediction target is the area burned by the forest fire. One important peculiarity of this dataset is that burned areas smaller than $1/100\; \text{ha} = 100\; \text{m}^2$ are marked as $0$. The following plot shows the number of small fires against bigger fires.
+
+```{r}
+small_big_count <- data.frame(
+  factor(c("small (<100m^2)", "big (>100m^2)"), levels=c("small (<100m^2)", "big (>100m^2)")),
+  c(sum(fires$area == 0), sum(fires$area > 0))
+)
+
+colnames(small_big_count) <- c("area", "count")
+
+ggplot(data=small_big_count, aes(x=area, y=count)) +
+  geom_bar(stat="identity", width=0.5) +
+  ggtitle("Number of fires") +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+The dataset contains a similar amount of big and small fires. It is necessary to keep this distinction in mind going forward.
+
+The following histogram shows the burned area distribution of the training set. As we can see, even if we only consider fires larger than the threshold, the distribution is still heavily right-skewed. Moreover, the data presents a few outliers much larger than the others.
+
+```{r}
+ggplot() +
+  geom_histogram(data=fires, mapping=aes(x=area), binwidth=30) +
+  ggtitle("Distribution of burned areas") +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+The authors of the dataset suggest to apply a transformation to the area attribute, namely $\ln{(x+1)}$, to reduce skewness and improve symmetry of the distribution of the target variable. The following plot shows the distribution of the burned area after this transformation. Note that our models will employ the transformed target rather than the original one.
+
+```{r}
+ggplot() +
+  geom_histogram(data=fires, mapping=aes(x=log(area+1)), binwidth=0.2) +
+  ggtitle("Distribution of burned areas (log)") +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+It is now possible to better understand the distribution of the burned area across the spatial coordinates plane. Note that burned areas smaller than $100\; \text{m}^2$ are displayed as gray points. Points are jittered around coordinate points.
+
+```{r}
+fires.big <- fires[fires$area > 0, ]
+
+ggplot(data=fires) +
+  geom_jitter(aes(x=X, y=Y, color=log(area+1)), alpha=0.8) +
+  scale_color_gradient(low="blue3", high="brown1", na.value="lightblue4", name="ln(area+1)", lim=c(min(log(fires.big$area+1)), max(log(fires.big$area+1)))) +
+  scale_x_discrete(position = "top") +
+  scale_y_discrete(limits=factor(9:1)) +
+  ggtitle("Areas of fires in each zone") +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.background = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank())
+```
+
+### Temporal data
+The dataset includes information about the day of the week and the month of the year. The following plot shows the area and the number of fires grouped by month of the year.
+
+```{r}
+moty_order <- factor(fires$month, c("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"))
+areas_month_plot <- ggplot(data=fires) +
+  geom_jitter(mapping=aes(x=moty_order, y=log(1+area)), width=0.1, alpha=0.4) +
+  ggtitle("Area (log) of fires by month") +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  labs(x="month of the year")
+count_month_plot <- ggplot(data=fires) +
+  geom_bar(mapping=aes(x=moty_order)) +
+  ggtitle("Number of fires by month") +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  labs(x="month of the year")
+
+plot_grid(nrow=2, areas_month_plot, count_month_plot)
+```
+
+As one can imagine, most fires occur during summer months, especially in August and September.
+
+Many wildfires are caused by humans. The authors of the dataset suppose that the day of the week may influence forest fires, as park affluence during work days is usually lower than weekends. Given this insight from the authors, in order to simplify our models, we collapse the days from Monday to Thursday and from Friday to Sunday by introducing a new binary predictor, `isweekend`. It takes $0$ value if the day is a work day and $1$ if it is a weekend day. This predictor will replace the day of the week predictor in our models.
+
+```{r, fig.width=4, fig.height=5}
+fires$isweekend <- factor(ifelse(fires$day %in% c("mon", "tue", "wed", "thu"), 0, 1))
+fires.test$isweekend <- factor(ifelse(fires.test$day %in% c("mon", "tue", "wed", "thu"), 0, 1))
+
+areas_weekend_plot <- ggplot(data=fires) +
+  geom_jitter(mapping=aes(x=isweekend, y=log(1+area)), width=0.1, alpha=0.4) +
+  ggtitle("Area (log) of fires by day type") +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  labs(x="is weekend?")
+count_weekend_plot <- ggplot(data=fires) +
+  geom_bar(mapping=aes(x=isweekend), width=0.5) +
+  ggtitle("Number of fires by day type") +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  labs(x="is weekend?")
+
+plot_grid(nrow=2, areas_weekend_plot, count_weekend_plot)
+```
+
+### Weather indices
+The dataset includes various weather indices based on the Canadian Forest Fire Weather Index (FWI), as described by @taylor.
+
+- *Fine Fuel Moisture Code* (FFMC) represents the moisture content of surface litter, which is key to ignition and fire spread.
+- *Duff Moisture Code* (DMC) and *Drought Code* (DC) represent the moisture content of shallow and deep organic layers, respectively. These are important to surface fire intensity and difficulty of control.
+- *Initial Spread Index* (ISI) is a score that correlates with fire velocity spread.
+
+In general, high values correspond to high risk of fires. The values of the indices in the dataset denote instant measurements as given by weather sensors, rather than the time lags used by the original FWI specification.
+
+```{r}
+nbins <- 30
+plot_grid(nrow=2, ncol=2,
+          ggplot(data=fires) + geom_histogram(mapping=aes(x=FFMC), bins=nbins),
+          ggplot(data=fires) + geom_histogram(mapping=aes(x=DMC), bins=nbins),
+          ggplot(data=fires) + geom_histogram(mapping=aes(x=DC), bins=nbins),
+          ggplot(data=fires) + geom_histogram(mapping=aes(x=ISI), bins=nbins))
+```
+
+Besides these indices, other basic weather observations were collected: *temperature*, *rain*, *relative humidity* and *wind speed*.  The rain variable denotes the accumulated precipitation within the previous 30 minutes. 
+
+```{r}
+nbins <- 30
+plot_grid(nrow=2, ncol=2,
+          ggplot(data=fires) + geom_histogram(mapping=aes(x=temp), bins=nbins),
+          ggplot(data=fires) + geom_histogram(mapping=aes(x=RH), bins=nbins),
+          ggplot(data=fires) + geom_histogram(mapping=aes(x=wind), bins=nbins),
+          ggplot(data=fires) + geom_histogram(mapping=aes(x=rain), bins=nbins))
+```
+
+The distribution of rain measurements during the occurrence of wildfires are, as we might imagine, very skewed towards $0$. In particular, the count of non-zero measurements is very low with respect to zeros. It is likely that this attribute yields low predicting power, so we decide to exclude it from our models.
+
+```{r, fig.width=3, fig.height=4}
+rain_count <- data.frame(c("zero", "non-zero"), c(nrow(subset(fires, rain==0)), nrow(subset(fires, rain>0))))
+colnames(rain_count) <- c("rain", "count")
+ggplot(data=rain_count, aes(x=rain, y=count)) +
+  geom_bar(stat="identity", width=0.5) +
+  ggtitle("Rain measurements") +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+In order to better understand the relationship between these weather-related quantitative predictors, we analyze their pairwise *correlation* using the *Pearson correlation coefficient* $\rho_{XY}$.
+
+$$
+\rho_{XY}
+=
+\frac{\text{Cov}(X, Y)}{\sigma_X \sigma_Y}
+=
+\frac{\mathbb{E}[(X-\mu_X)(Y-\mu_Y)]}{\sqrt{\mathbb{E}[(X-\mu_X)^2]}\;\sqrt{\mathbb{E}[(Y-\mu_Y)^2]}}
+$$
+
+Since the correlation coefficient of the population is unknown, we may estimate it as the *sample Pearson correlation coefficient* $r_{XY}$. To obtain $r_{XY}$ it is sufficient to substitute the estimates for the covariance and variances of our sample.
+
+$$
+r_{XY}
+=
+\frac{\sum_i(x_i-\bar{x})(y_i-\bar{y})}{\sqrt{\sum_i(x_i-\bar{x})^2} \sqrt{\sum_i(y_i-\bar{y})^2}}
+$$
+
+Here, $\bar{x}=\frac{1}{n}\sum_i x_i$ and $\bar{y}=\frac{1}{n}\sum_i y_i$.
+
+The correlation coefficient ranges between $-1$ and $1$. It measures the strength of the linear relationship between $X$ and $Y$. If $X$ and $Y$ are linearly positively correlated, then $r_{XY} > 0$, so that values of $X$ greater than its mean are associated to $Y$ values also greater than its mean. Conversely, if $X$ and $Y$ are linearly negatively correlated, then $r_{XY} < 0$. A correlation coefficient close to $0$ implies that there is no linear correlation between $X$ and $Y$.
+
+The following heatmap shows estimates of the correlation of pairs of predictors according to our data.
+
+```{r}
+cm <- cor(fires[, c(5,6,7,8,9,10,11,13)])
+ggcorrplot(cm, type="lower", lab=TRUE)
+```
+
+Note that most FWI indices and temperature are pairwise linearly positively correlated, even if not strongly so. Notably, the DMC and DC indices are more strongly positively correlated than other pairs of predictors. This means that, as the DMC value increases, DC also tends to increase, and viceversa. However, note that this does not imply any causality. FFMC and ISI are also linearly positively correlated, as we would expect since they both relate to the velocity at which fire spreads. Finally, notice that the area is not strongly linearly correlated to any particular predictor.
+
+The main drawback of the Pearson correlation coefficient is that it only measures the *linear* correlation between two predictors. In fact, two predictors may have correlation equal to zero and still be non-linearly correlated. Moreover, $\rho$ is not able to measure correlation among more than two predictors at once, i.e., *multicollinearity*.
+
+# Linear regression
+Our first attempt at predicting the burned area of forest fires based on the available attributes is by applying multiple linear regression, as part of the *general linear model*.
+
+## Theoretical framework
+
+### General linear model
+
+Consider a known *design matrix* $X$, with $x_{ij}$ being the $j$-th predictor of the $i$-th sample. The design matrix has dimensions $n \times p$, with $n$ being the number of samples and $p$ the number of predictors. The goal is to explain the probabilistic behaviour of the *responses* $y=(y_1, \dots, y_n)'$, considered as realizations of the normal random variables $Y=(Y_1, \dots, Y_n)'$.
+
+The relationship between $Y$ and $X$ is modeled as the following linear combination.
+
+$$
+Y = X \beta + \epsilon
+$$
+
+Where $\beta=(\beta_1, \dots, \beta_{p})'$ is the vector of unknown *parameters*, object of statistical inference, and $\epsilon=(\epsilon_1, \dots, \epsilon_n)'$ is a vector of independent and identically distributed random variables that represents the *error* (e.g., natural variability, measurement error) added to $X\beta$. While errors are unobservable, we may make some assumptions for our convenience:
+
+- errors are centered at $0$, i.e., $\mathbb{E}[\epsilon_i] = 0\;\; \forall i=1,\dots, n$;
+- errors have the same variance (homoscedasticity), i.e., $\text{Var}(\epsilon_i) = \sigma^2\;\; \forall i=1,\dots,n$;
+- errors are uncorrelated;
+- errors are normally distributed.
+
+The error is distributed as a multivariate normal $\epsilon \sim \mathcal{N}_n(0, \sigma^2I)$. This implies that the response vector is also distributed as a multivariate normal, with every random variable $Y_i$ having the same variance (homoscedasticity).
+$$
+Y \sim \mathcal{N}_n(X\beta, \sigma^2I)
+$$
+
+Responses $Y_i$ are independent, but not identically distributed, as every element has a different mean $\sum_{j=1}^p x_{ij} \beta_j$.
+
+### Maximum likelihood estimators
+
+It is not possible to know the true value of the parameters $\beta$. However, given a dataset sampled from the population of interest, it is possible to *estimate* them. One way to do so is by deriving the *maximum likelihood estimators* for $\beta_i$, and using them to compute estimates $\hat{\beta}_i$.
+
+The goal is to maximize the likelihood function $\mathcal{L}$ by holding $X$ fixed, in order to find the parameters that would produce a probability density function that assigns maximum values to our observations $y=(y_1, \dots, y_n)'$. The likelihood function has the following form.
+
+$$
+\mathcal{L}(\beta \mid y_1, \dots, y_n) \propto e^{-\frac{1}{2 \sigma^2} \parallel y - X\beta\parallel^2}
+$$
+
+Here, maximizing $\mathcal{L}$ is equivalent to minimizing $\parallel y - X\beta\parallel^2$. This is an *ordinary least squares* (OLS) minimization problem. Our goal is to minimize the sum of squares difference between the observed values $y$ and the values predicted by the linear function $X\beta$. Note that $\parallel \cdot \parallel$ represents the Euclidean norm.
+
+$$
+\min_\beta{\parallel y - X\beta \parallel^2}
+$$
+
+If $(X'X)$ is invertible, the maximum likelihood estimator for $\beta$ is:
+
+$$
+\hat{\beta} = (X'X)^{-1}X' Y
+$$
+
+The sampling distribution of $\hat{\beta}$ is multivariate normal, since it is a linear transformation of the response $Y$.
+
+$$
+\hat{\beta} \sim \mathcal{N}_p\left(\beta, \sigma^2(X'X)^{-1}\right)
+$$
+
+This is an *unbiased* estimator, meaning that, on average, it does not over- nor underestimate the parameters.
+
+In the following sections, given the vector $y$ of observations of $Y$ obtained by employing the design matrix $X$, we exploit the maximum likelihood estimator to obtain estimates $\hat{\beta} = (X'X)^{-1}X'y$. This allows us to make predictions for a new set of predictor values.
+
+## Simple linear regression
+As a first naive approach to the problem, we attempt to predict the burned area by employing temperature as our one and only predictor. This helps us understand the framework better before moving on to build more complex models.
+
+```{r}
+naive.lm <- lm(log(area+1) ~ temp, data=fires)
+summary(naive.lm)
+```
+
+Formally, this simple model attempts to fit a line $\hat{\beta_0} + \hat{\beta_1} x$ to our observations. In other words, it assumes that there is approximately a linear relationship between the response $Y$ and the predictor $X$.
+
+For simple linear regression, OLS yields the following estimators.
+
+$$
+\begin{align}
+\hat{\beta_0} &= \bar{y} - \hat{\beta_1} \bar{x}\\
+\hat{\beta_1} &= \frac{\sum_i(x_i - \bar{x})(y_i-\bar{y})}{\sum_i(x_i-\bar{x})^2}
+\end{align}
+$$
+
+$\hat{\beta_0}$ represents the intercept, while $\hat{\beta_1}$ corresponds to the slope of the fitted line. As we can see from the summary of our fitted simple linear model, the parameter estimates are:
+
+$$
+\begin{align}
+\hat{\beta_0} &= 0.83247\\
+\hat{\beta_1} &= 0.01381
+\end{align}
+$$
+
+This means that, on *average*, we *estimate* that when the temperature increases by $1$, the burned area increases by $0.01381$, holding all other predictors fixed.
+
+The following plot shows the fitted regression line. Intuitively, we can say that temperature as a sole variable is not sufficient to predict the burned area.
+
+```{r, message=FALSE}
+ggplot(data=fires, mapping=aes(x=temp, y=log(area+1))) +
+  geom_point(alpha=point_alpha) +
+  geom_smooth(method="lm", color=line_color, se=FALSE) +
+  ggtitle("Regression line") +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+### Analysis of residuals
+It is important to introduce the concept of *residuals*. A residual $e_i$ is the difference between the observed value $y_i$ and the estimated value $\hat{y_i} = x_i\hat{\beta}$. Residuals are different from errors, which are defined as the difference between the observed value $y_i$ and the true (unobservable) value. However, it is possible to consider residuals as an empirical approximation of errors.
+
+The linear model summary gives us quartiles of the distribution of residuals. For our linear model to be considered reliable, the residuals should look like they were sampled from independent and identically distributed errors $\epsilon_i \sim \mathcal{N}(0, \sigma^2)$. A first warning sign that this assumption may be violated is that the distribution of residuals is positively skewed. This may be due to the large amount of $0$ burned area values.
+
+To further assess model adequacy, we consider *residual plots*.
+
+```{r, fig.width=9, fig.height=5, message=FALSE}
+res_fit_df <- data.frame(
+  "residuals" = naive.lm$residuals,
+  "fitted" = naive.lm$fitted.values
+)
+
+res_fit <- ggplot(data=res_fit_df, mapping=aes(x=fitted, y=residuals)) +
+  geom_abline(slope=0, intercept=0, color="black", linetype=2, size=1) +
+  geom_point(alpha=point_alpha) +
+  geom_smooth(color=line_color, se=FALSE) +
+  ggtitle("Residuals against fitted") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+qq <- ggplot(data=res_fit_df, mapping=aes(sample=residuals)) +
+  geom_qq(alpha=point_alpha) +
+  stat_qq_line(color="black", linetype=2, size=1) +
+  ggtitle("Normal Q-Q") +
+  ylab("standardized residuals") +
+  xlab("theoretical quantiles") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+plot_grid(nrow=1, ncol=2, res_fit, qq)
+```
+
+The plot on the left shows residuals against fitted values. This plot should show a patternless cloud of points, otherwise the assumptions of independence or same variance of errors may be violated. Notice that a large amount of points live on a line trending downwards. As we thought, these residuals correspond to areas marked as $0$ in the dataset and are therefore problematic.
+
+The plot on the right shows a normal Q-Q plot of standardized residuals. This plot is useful to check whether the distribution of residuals has the same shape as a normal, in which case the points would lie on the theoretical line. In this case, it is evident that the areas marked as $0$ in the dataset influence the shape of the residuals distribution, which cannot be considered as normal as it is heavily positively skewed.
+
+### Inference on coefficients
+If we assume that $\hat{\beta}$ has a multivariate normal distribution, thus $\hat{\beta_i} \sim \mathcal{N}\left(\beta_i, \sigma^2\,[(X'X)^{-1}]_{i+1, i+1}\right)$, it is possible to build confidence intervals and perform hypothesis testing on coefficients.
+
+Consider the standard error of the coefficients, which can be written as $\text{SE}(\hat{\beta_i})=\sqrt{\sigma^2[(X'X)^{-1}]_{i+1, i+1}}$.
+
+To derive an estimator $\hat{\text{SE}}(\hat{\beta_i})$, it is first necessary to find an estimator for the error variance $\sigma^2$. An unbiased estimator is the *mean squared residual* (MSR), which is equal to the *residual sum of squares* (RSS) divided by the number of degrees of freedom.
+
+$$
+\text{MSR} = \frac{\text{RSS}}{n-p} = \frac{e'e}{n-p}
+$$
+
+Having introduced a good estimator for $\sigma^2$, we are now able to construct *confidence intervals* for the parameters. The 95% confidence intervals for $\hat{\beta_0}$ and $\hat{\beta_1}$, according to our data, are the following.
+
+```{r}
+confint(naive.lm)
+```
+
+Besides confidence intervals, it is possible to construct the following kind of *hypothesis test*.
+
+$$
+H_0: \beta_i = 0
+$$
+
+The null hypothesis is equivalent to saying that the associated $i$-th predictor does not affect the mean response. In other words, we want to reject the null hypothesis that the $i$-th predictor is not useful and should be removed from our model.
+
+This hypothesis test uses the t-statistic $\hat{\beta_i}/\hat{SE}(\hat{\beta_i})$. For each coefficient in our model, the R output shows the t-statistics value and its p-value.
+
+In our case, the p-value for the temperature coefficient is quite large, and we cannot reject the null hypothesis. This implies that the temperature predictor probably does not affect the mean response. If we remove this predictor, this would yield a null model, with the only parameter being the intercept.
+
+### Goodness of fit
+The output of our simple linear regression shows the following metrics. These can help us understand the performance of our model.
+
+- *Residual standard error* (RSE), an unbiased estimator of the standard deviation of the errors, which is simply the square root of the MSR as defined previously.
+$$
+\text{RSE}=\sqrt{\text{MSR}}=\sqrt{\frac{e'e}{n-p}}
+$$
+
+- *Coefficient of determination*, defined as the proportion of variation in $y$ accounted by the linear regression on the predictors. In other words, it is the ratio between the amount of variability in the response *explained by the regression* and the total amount of variability in the response, i.e., the residual sum of squares corresponding to the null model.
+$$
+R^2=\frac{e'_0e_0-e'e}{e'_0e_0} = \frac{\sum_i(\hat{y_i}-\bar{y})^2}{\sum_i(y_i-\bar{y})^2}
+$$
+This coefficient increases if we add any new predictor. To correct for this kind of overfitting, we also introduce the *adjusted* $R^2$, which instead pays a price for the inclusion of unnecessary variables in the model.
+$$
+R^2_{adj} = 1-(1-R^2)\frac{n-1}{n-p-1}
+$$
+
+- Results of a *global test*, namely the value of the F-statistic and its p-value. The null hypothesis of the global test, or all-or-nothing test, is $H_0: \beta_1=\beta_2=\ldots=\beta_{p-1}=0$, i.e., all the coefficients except the intercept are equal to zero. If the p-value is small enough, we can reject the null hypothesis that the regression is not useful.
+
+Our model yields a very high p-value for the global test and a very low $R^2$. This means that it is not a good idea to perform linear regression on the burned area using temperature as our only predictor. In the following sections, we explore bigger models and test their performance using these metrics.
+
+### Metrics
+Additionally, @cortez introduce the following metrics to evaluate the overall predictive performance of a model.
+
+- *Mean Absolute Error* (MAE):
+$$
+\text{MAE} = \frac{1}{n} \sum_i |y_i - \hat{y_i}|
+$$
+A smaller MAE value results in a better predictive model. This metric is fairly robust to outliers, therefore a model with relatively small MAE may still produce very high error on outliers.
+
+- *Root Mean Squared Error* (RMSE):
+$$
+\text{RMSE}=\sqrt{\frac{e'e}{n}}=\sqrt{\frac{\sum_i (y_i-\hat{y_i})^2}{n}}
+$$
+This metric is more sensitive to outliers than MAE. A smaller RMSE corresponds to a better model.
+
+We use the two latter metrics to evaluate and compare the performance our models. Note that RMSE and RSE differ only by their denominator. RMSE is a biased estimator of the standard deviation of errors, unlike RSE which is unbiased.
+
+Note that, before computing these metrics, the output of the models is post-processed using the inverse of the logarithm transform. If the transformation leads to negative numbers, these are set to zero.
+
+The following code computes the MAE and RMSE on training data for our simple model.
+
+```{r}
+loginv <- function(x) {
+  output <- exp(x) - 1
+  output[output < 0] <- 0.
+  return(output)
+}
+
+mae <- function(truth, preds) {
+  mae <- mean(abs(truth - preds))
+  return(mae)
+}
+
+rmse <- function(truth, preds) {
+  rmse <- sqrt(mean((truth - preds)^2))
+  return(rmse)
+}
+
+naive.preds <- loginv(predict(naive.lm, fires, type="response"))
+
+print(data.frame("MAE"=mae(fires$area, naive.preds), "RMSE"=rmse(fires$area, naive.preds), row.names=c("naive.lm")))
+```
+
+## Complete model
+Our simple linear regression model is not able to predict the area burned by forest fires using temperature only. Therefore, we now consider a new model built using all available predictors, i.e., the *complete model*.
+
+```{r}
+complete.lm <- lm(log(area+1) ~ X + Y + month + isweekend + FFMC + DMC + DC + ISI + temp + RH + wind, data=fires)
+summary(complete.lm)
+```
+
+The model summary shows that the factors, namely the coordinates X and Y as well as month of the year and weekend indicator, are encoded in the regression model using dummy variables.
+
+In general, a factor with $l$ levels is encoded using $l-1$ dummy variables. This is due to the fact that the columns of $(X'X)$ must be linearly independent for it to be invertible. For instance, take the month predictor. January is taken as a reference level, and the model uses 11 variables to encode the 12-level factor. The following code shows the estimated coefficients related to the month factor.
+
+```{r}
+complete.lm$coefficients[grepl("month", names(complete.lm$coefficients))]
+```
+
+The global test has a p-value of $0.000293$. While this is a low p-value and we can reject the null hypothesis, it is still not very close to zero. This means that this model may still not be able to accurately predict the response using the available predictors.
+
+To test whether the complete model is better than the previous simple linear model, we may use ANOVA. This method is useful to compare a big model to a smaller model, provided they are nested.
+
+```{r}
+print(anova(naive.lm, complete.lm))
+```
+
+The results of ANOVA tell us that we can reject the hypothesis that the simple linear model is good enough, compared to the complete model. The p-value of the F-statistic is quite low, but again, it is not as low as we would want.
+
+We may also want to test what happens if we take out one of the predictors from the complete model. For instance, suppose we want to test if removing the weekend indicator still yields a good enough model.
+
+```{r}
+complete.noweekend.lm <- lm(log(area+1) ~ X + Y + month + FFMC + DMC + DC + ISI + temp + RH + wind, data=fires)
+print(anova(complete.noweekend.lm, complete.lm))
+```
+
+According to the results, we cannot reject the hypothesis that the model without the weekend indicator works well enough.
+
+## Custom models
+Our goal is to understand whether a model that uses only a subset of all available predictors performs as well or better than the complete model. Based on @cortez, we employ four different predictor setups:
+
+- **STFWI** uses spatial, temporal and the four FWI indices;
+- **STM** uses spatial, temporal and the three weather variables;
+- **FWI** uses the four FWI indices;
+- **M** uses the three weather variables.
+
+```{r, message=FALSE}
+stfwi.lm <- lm(log(area+1) ~ X + Y + month + isweekend + FFMC + DMC + DC + ISI, data=fires)
+stm.lm <- lm(log(area+1) ~ X + Y + month + isweekend + temp + RH + wind, data=fires)
+fwi.lm <- lm(log(area+1) ~ FFMC + DMC + DC + ISI, data=fires)
+m.lm <- lm(log(area+1) ~ temp + RH + wind, data=fires)
+```
+
+Firstly, we carry out an ANOVA test to understand whether the smaller, nested models (FWI and M) explain the data well enough when compared to their bigger counterparts that include temporal and spatial predictors.
+
+```{r}
+print(anova(fwi.lm, stfwi.lm))
+```
+
+```{r}
+print(anova(m.lm, stm.lm))
+```
+
+In both cases, the p-value of the F-statistic is small enough to reject the null hypothesis that the the smaller model is good enough.
+
+To directly compare non-nested models together, we can use *Aikaike's Information Criterion* (AIC), defined as follows.
+
+$$
+\text{AIC} = 2(p+1)-2\ln{(\hat{\mathcal{L}})}
+$$
+
+According to this criterion, the model with the smallest AIC should be preferred. We want the maximum likelihood $\hat{\mathcal{L}}$ to be as large as possible, and the number of parameters $p+1$ to be as small as possible. Thus, AIC is a tradeoff between model complexity, measured as number of parameters, and goodness of fit.
+
+To compare the performance of the fitted models, we may compute some additional metrics, such as the MAE, RMSE and adjusted $R^2$ on the training set. The following table shows these metrics for the four custom models, as well as on the complete and simple models.
+
+```{r}
+subset.scores <- AIC(complete.lm, stfwi.lm, stm.lm, fwi.lm, m.lm, naive.lm)
+
+subset.scores["adj R2"] <- c(
+  summary(complete.lm)$adj.r.squared,
+  summary(stfwi.lm)$adj.r.squared,
+  summary(stm.lm)$adj.r.squared,
+  summary(fwi.lm)$adj.r.squared,
+  summary(m.lm)$adj.r.squared,
+  summary(naive.lm)$adj.r.squared
+)
+
+complete.preds <- loginv(predict(complete.lm, fires, type="response"))
+stfwi.preds <- loginv(predict(stfwi.lm, fires, type="response"))
+stm.preds <- loginv(predict(stm.lm, fires, type="response"))
+fwi.preds <- loginv(predict(fwi.lm, fires, type="response"))
+m.preds <- loginv(predict(m.lm, fires, type="response"))
+
+subset.scores["MAE"] <- c(
+  mae(fires$area, complete.preds),
+  mae(fires$area, stfwi.preds),
+  mae(fires$area, stm.preds),
+  mae(fires$area, fwi.preds),
+  mae(fires$area, m.preds),
+  mae(fires$area, naive.preds)
+)
+
+subset.scores["RMSE"] <- c(
+  rmse(fires$area, complete.preds),
+  rmse(fires$area, stfwi.preds),
+  rmse(fires$area, stm.preds),
+  rmse(fires$area, fwi.preds),
+  rmse(fires$area, m.preds),
+  rmse(fires$area, naive.preds)
+)
+
+print(subset.scores)
+```
+
+The best overall fit appears to be given by the STM subset of predictors. This model yields a good combination of relatively low AIC, RMSE and MAE, while using a lower number of predictors than the complete model. Moreover, it retains the second-highest adjusted $R^2$, meaning the model is able to explain more variability in the response than all other models except the complete model, even if the ratio on the total variability is still quite low.
+
+As we noted, the complete model includes four more predictors than the STM model. The usage of these additional predictors is not justified, as there is not enough evidence that they contribute to a higher model performance. In fact, the following ANOVA test shows that we cannot reject the hypothesis that STM performs well enough when compared to the complete model.
+
+```{r}
+print(anova(stm.lm, complete.lm))
+```
+
+To wrap up, the following plots report an analysis of the residuals of the STM model.
+
+```{r, fig.width=9, fig.height=5, message=FALSE}
+stm.res_fit_df <- data.frame(
+  "residuals" = stm.lm$residuals,
+  "fitted" = stm.lm$fitted.values
+)
+
+stm.res_fit <- ggplot(data=stm.res_fit_df, mapping=aes(x=fitted, y=residuals)) +
+  geom_abline(slope=0, intercept=0, color="black", linetype=2, size=1) +
+  geom_point(alpha=point_alpha) +
+  geom_smooth(color=line_color, se=FALSE) +
+  ggtitle("Residuals against fitted") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+stm.qq <- ggplot(data=stm.res_fit_df, mapping=aes(sample=residuals)) +
+  geom_qq(alpha=point_alpha) +
+  stat_qq_line(color="black", linetype=2, size=1) +
+  ggtitle("Normal Q-Q") +
+  ylab("standardized residuals") +
+  xlab("theoretical quantiles") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+plot_grid(nrow=1, ncol=2, stm.res_fit, stm.qq)
+```
+
+The residuals against fitted values plot shows that the homoscedasticity and independence assumptions on errors are violated. Moreover, the normal Q-Q plot still does not approximate a straight line, therefore the normality assumption on errors is violated as well. This is reflected on the predictive performance of our model, which is very poor.
+
+Unfortunately, this model is not able to satisfactorily predict the burned area of forest fires. This may be due to the lack of appropriate predictors in the dataset (such as vegetation type), the presence of outliers and areas marked as $0$, or simply the fact that the relationship between the response variable and the predictors is more complex than linear.
+
+Nonetheless, for the sake of comparison to other models, we compute the performance on the test set of the best linear regression model, STM.
+
+```{r}
+stm.test.preds <- loginv(predict(stm.lm, fires.test, type="response"))
+
+print(data.frame(
+  "MAE"=mae(fires.test$area, stm.test.preds),
+  "RMSE"=rmse(fires.test$area, stm.test.preds),
+  row.names=c("stm.lm")
+))
+```
+
+# Logistic regression
+It is possible to approach the problem of predicting the burned area of forest fires in a different way, given the characteristics of our data. In particular, a consistent part of our dataset consists of fires smaller than a hundred square meters, all marked as $0$. We may think of giving up information on the exact size of the burned area, and encode a binary predictor as our target.
+
+In other words, we are not interested anymore in predicting the exact size of forest fires. Rather, we are only interested in predicting whether the fire is a large one or a small one, based on our predictors.
+
+```{r}
+fires$areabinary <- factor(ifelse(fires$area > 0, 1, 0))
+fires.test$areabinary <- factor(ifelse(fires.test$area > 0, 1, 0))
+```
+
+## Theoretical framework
+### Response variable
+The elements in the response vector $Y=(Y_1, \dots, Y_n)'$ are now binary ($0$ if the fire is small, $1$ if it is large), drawn from a Bernoulli distribution.
+
+$$
+Y_i \sim \text{Bernoulli}(p_i)
+$$
+
+Here, $p_i\in[0,1]$ is the probability that $Y_i=1$.
+
+A simple linear predictive model is not suitable for this type of qualitative response. Consider a toy dataset where responses are either equal to $0$ or $1$. The only predictor is sampled from either one of two normal distributions, depending on the response. The following plot shows a simple linear regression line fitted on this dataset.
+
+```{r, message=FALSE}
+set.seed(123)
+data.example.zero <- data.frame(predictor=rnorm(20, 1, 2), response=rep(0, 20))
+data.example.one <- data.frame(predictor=rnorm(20, 5, 2), response=rep(1, 20))
+data.example <- rbind(data.example.zero, data.example.one)
+
+ggplot(data=data.example, aes(x=predictor, y=response)) +
+  geom_smooth(method="lm", color=line_color, se=FALSE) +
+  geom_point(alpha=point_alpha) +
+  ggtitle("Linear regression on toy dataset") +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  scale_y_continuous(breaks=seq(0, 1 ,1))
+```
+
+The fitted linear regression predicts the expected value of the response $Y_i$, which for a Bernoulli random variable is $\mathbb{E}[Y_i]=p_i$, i.e., the probability of a positive response. In general, a line is not bounded to any interval. Therefore, it is not appropriate to predict a probability $p\in[0,1]$.
+
+The plot highlights this issue, as the line crosses both these bounds, producing invalid probability estimates. The generalized linear model, described in the following section, provides a solution to this problem.
+
+### Generalized linear model
+The general linear model assumes that the response variable $Y$ is quantitative and the errors are normally distributed. The generalized linear model instead does not require these assumptions. Therefore, we may use it when our response variable has a Bernoulli distribution.
+
+The components of the generalized linear model are:
+
+- a *response vector* $Y=(Y_1, \dots, Y_n)'$ with mean $\mu=(\mu_1, \dots, \mu_n)'$;
+- a *linear predictor* $\eta=X\beta$ expressed as a linear combination of unknown parameters;
+- a *link function* $g(\cdot)$ such that $g(\mu_i)=\eta_i$.
+
+Note that when $g(\mu_i)=\mu_i$, i.e., the link function is the identity function, this framework corresponds to linear regression. In this case, $\eta=\mu=X\beta$.
+
+For the reasons explained in the previous section, we cannot use an identity function as a link. A more suitable choice is the *logit* link function.
+
+$$
+\text{logit}(p)=\log{\frac{p}{1-p}}
+$$
+
+The logit is also called *logodds* function, since it is the logarithm of the *odds* $\frac{p}{1-p}$ where $p$ is a probability. The logit function maps any value in the probability interval to $\mathbb{R}$.
+
+If we apply logistic regression to the previous toy dataset, we get the following fit.
+
+```{r, message=FALSE}
+ggplot(data=data.example, aes(x=predictor, y=response)) +
+  geom_smooth(method="glm", method.args=list(family=binomial(link="logit")), color=line_color, se=FALSE) +
+  geom_point(alpha=point_alpha) +
+  ggtitle("Logistic regression on toy dataset") +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  scale_y_continuous(breaks=seq(0, 1 ,1))
+```
+
+This is clearly a better solution to our problem. Any value of the predictor is mapped to a valid estimate for the probability of the response being $Y_i=1$.
+
+## Simple model
+The first logistic regression model that we fit is a simple model that attempts to predict whether the burned area of a firest fire is larger or smaller than $100\; \text{m}^2$ by employing only the temperature and weekend indicator predictors. This helps us understand how the coefficients affect the response.
+
+```{r}
+tw.glm <- glm(areabinary ~ temp + isweekend, data=fires, family=binomial(link="logit"))
+coefficients(tw.glm)
+```
+
+The first estimated coefficient of interest is the one associated with the weekend indicator predictor. Consider the formula for the estimate of the logit for the $i$-th observation.
+
+$$
+\hat{\text{logit}(p_i)}=x_i\hat{\beta} = c - 0.237 \cdot \text{isweekend}
+$$
+
+Here, the constant $c$ depends on the value of the other predictors for the $i$-th sample, which we suppose remain fixed. Our fitted logistic regression model estimates that $\hat{\text{logit}(p_i)}$ is equal to $c-0.237$ if the weekend indicator is $1$, i.e., the fire occurred during the weekend, and to $c$ otherwise.
+
+This implies that the parameter estimate $-0.237$ is the difference between the logit when the weekend indicator predictor is equal to $1$, which we call $\hat{\text{logit}(p_i)}_1$, and the logit when the predictor is equal to $0$, which we call $\hat{\text{logit}(p_i)}_0$. This difference is equal to the *logodds ratio*.
+
+$$
+-0.237=\hat{\text{logit}(p_i)}_1-\hat{\text{logit}(p_i)}_0=\log \frac{\left( \frac{\hat{p_i}}{1-\hat{p_i}} \right)_1}{\left( \frac{\hat{p_i}}{1-\hat{p_i}} \right)_0} 
+$$
+
+The higher the logodds ratio, the higher the difference in probability of the response being equal to $1$ when the weekend indicator is $1$ with respect to when it is $0$.
+
+To quantify the differential effect of this binary predictor on a certain sample $i$, we can compute the estimated probabilities. Assuming the $i$-th observation was taken on a hot day with a temperature equal to $30$ degrees, and that we want to estimate the effects of the weekend predictor on the response, we have that:
+
+$$
+\begin{align}
+  \hat{\text{logit}(p_i)}
+  = x_i\hat{\beta} &= -0.271+0.023 \cdot \text{temp} - 0.237 \cdot \text{isweekend} \\
+  &= 0.419 - 0.237 \cdot \text{isweekend}
+  &
+\end{align}
+$$
+
+By taking the inverse of the logit, we get an estimated probability that depends on the value of $\text{isweekend}$.
+
+$$
+\hat{p_i} =
+\begin{cases}
+\frac{1}{1+e^{-(0.419-0.237)}}=0.545 & \text{if isweekend}=1 \\
+\frac{1}{1+e^{-0.419}}=0.603 & \text{otherwise}
+\end{cases}
+$$
+
+Therefore, according to our simple logistic model, the estimated probability that the burned area of a forest fire on a $30$ degrees day is higher than $100\; \text{m}^2$ is slightly higher on work days than on weekends, with the other variables fixed.
+
+The other coefficient of interest corresponds to temperature. Analogously, the estimate for this coefficient means that a $1$ unit increase in temperature corresponds to an estimated increase of $0.023$ in the logodds of a large fire, holding other predictors constant. This confirms our intuition that a fire that occurs during a hotter day will have a higher estimated probability of being a big fire.
+
+## Complete and custom models
+Consider the four combinations of predictors proposed by @cortez, as well as the complete model.
+
+```{r}
+complete.glm <- glm(areabinary ~ X + Y + month + isweekend + FFMC + DMC + DC + ISI + temp + RH + wind, data=fires, family=binomial(link="logit"))
+stfwi.glm <- glm(areabinary ~ X + Y + month + isweekend + FFMC + DMC + DC + ISI, data=fires, family=binomial(link="logit"))
+stm.glm <- glm(areabinary ~ X + Y + month + isweekend + temp + RH + wind, data=fires, family=binomial(link="logit"))
+fwi.glm <- glm(areabinary ~ FFMC + DMC + DC + ISI, data=fires, family=binomial(link="logit"))
+m.glm <- glm(areabinary ~ temp + RH + wind, data=fires, family=binomial(link="logit"))
+```
+
+To select a suitable model among these candidates, we firstly consider the AIC.
+
+```{r}
+glm.scores <- AIC(complete.glm, stfwi.glm, stm.glm, fwi.glm, m.glm)
+print(glm.scores)
+```
+
+The lowest AIC corresponds to the STM model. Interestingly, this is the same combination of parameters of our best linear model.
+
+Since the dataset is balanced between large and small fires, we can consider *accuracy* as an additional metric to evaluate the predictive performance of our models.
+
+To estimate the model accuracy on unseen data, we can perform *K-fold cross validation* using our training set. We generate $K=10$ folds. For each fold $k$, we train our models on 9 out of the 10 folds and compute the accuracy of predictions on the remaining $k$-th fold. In the end, for each model we display the average accuracy over all folds.
+
+```{r}
+set.seed(42)
+
+train.control <- trainControl(method="cv", number=10)
+
+options(warn=-1)
+complete.cv.glm <- train(areabinary ~ X + Y + month + isweekend + FFMC + DMC + DC + ISI + temp + RH + wind, data=fires, method="glm", family=binomial(link="logit"), trControl=train.control)
+stfwi.cv.glm <- train(areabinary ~ X + Y + month + isweekend + FFMC + DMC + DC + ISI, data=fires, method="glm", family=binomial(link="logit"), trControl=train.control)
+stm.cv.glm <- train(areabinary ~ X + Y + month + isweekend + temp + RH + wind, data=fires, method="glm", family=binomial(link="logit"), trControl=train.control)
+fwi.cv.glm <- train(areabinary ~ FFMC + DMC + DC + ISI, data=fires, method="glm", family=binomial(link="logit"), trControl=train.control)
+m.cv.glm <- train(areabinary ~ temp + RH + wind, data=fires, method="glm", family=binomial(link="logit"), trControl=train.control)
+options(warn=0)
+
+glm.scores[, "CVAccuracy"] = c(
+  complete.cv.glm$results$Accuracy,
+  stfwi.cv.glm$results$Accuracy,
+  stm.cv.glm$results$Accuracy,
+  fwi.cv.glm$results$Accuracy,
+  m.cv.glm$results$Accuracy
+)
+
+print(glm.scores)
+```
+
+Considering both AIC and cross validation accuracy, the combination of predictors STFWI appears to be the best choice for our logistic regression model.
+
+To collect further insights into this model and evaluate its predictive performance, we compute the accuracy score and the confusion matrix of predictions on the test set.
+
+```{r}
+threshold <- 0.5  # cutoff
+
+stfwi.glm.logodds <- predict(stfwi.glm, fires.test)  # these are the predicted log-odds = log(p/(1-p))
+stfwi.glm.probs <- 1/(1+exp(-stfwi.glm.logodds))  # these are the predicted probabilities p
+stfwi.glm.preds <- factor(ifelse(stfwi.glm.probs > threshold, 1, 0))
+
+cm <- confusionMatrix(stfwi.glm.preds, fires.test$areabinary)
+print(cm$table)
+print(cm$overall["Accuracy"])
+```
+
+These results shows that the model is not able to perform very well on our test set, with its accuracy being only slightly better than a coin flip. The confusion matrix shows that the model misclassifies a large number of fires.
+
+# Random forest regression
+Consider the original regression problem again. Since the general linear model did not yield satisfactory results, in this section we apply a *tree-based* regression method.
+
+## Theoretical framework
+In the regression setting, we can build a regression tree using the following procedure. First, we divide the predictor space into $J$ distinct, non-overlapping regions $R_1, \dots, R_J$ via a set of decision rules. Then, we make the same prediction $\hat{y}_{R_j}$ for every observation that falls inside the $j$-th region. The prediction for the $j$-th region is the mean of the response of the samples inside it.
+
+The regions are chosen so that they minimize the RSS. In principle, the lower the RSS, the better the split, since the predictions are closest to the actual response.
+$$
+\text{RSS} = \sum_{j=1}^{J} \sum_i (y_i - \hat{y}_{R_j})^2
+$$
+However, it is not possible to explore all possible partitions of the feature space to find the one that minimizes the RSS globally. Therefore, we use *recursive binary splitting*, a greedy approach that begins at the top of the tree and successively splits the predictor space.
+
+At each step, the algorithm chooses the best predictor and cutpoint to divide the region, such that the split yields the smallest RSS possible. It is greedy because it does not take into account possible future splits that may yield an even smaller RSS down the line. Every step divides an existing region into two regions, based on the chosen decision rule. This process is repeated until a stopping criterion is reached (e.g., maximum tree depth, maximum number of leaves or RSS threshold).
+
+## Decision tree
+The first tree-based algorithm we use is a simple decision tree.
+
+Note that we set the minimum amount of observations to include in either child node to $15$. This limits the number of leaf nodes, to reduce overfitting and make the decision tree more easily interpretable.
+
+```{r}
+set.seed(42)  # For reproducibility
+complete.tree <- tree(log(area+1) ~ X + Y + month + isweekend + FFMC + DMC + DC + ISI + temp + RH + wind, data=fires, mincut=15)
+summary(complete.tree)
+```
+
+The model summary tells us that only a subset of all the available predictors were chosen by the algorithm to partition the feature space. The output also gives us additional information regarding redisuals, namely the distribution of residuals in quartiles and the residual mean deviance, which is equal to the MSR as defined previously.
+
+One of the main advantages of using a simple regression tree is its high interpretability. Here, we plot the tree to see how it takes its decisions, based on the value of the predictors.
+
+```{r}
+plot(complete.tree)
+text(complete.tree, pretty=0)
+```
+
+The root node splits the predictor space based on the value of the X coordinate. According to this tree, on average, the fires that occur inside coordinates 3 and 5 are smaller than the others. The second split is made on a weather index, DMC, setting a cutoff value to $118.45$ to further split the region of predictors where X is not equal to 3 or 5. Graphically, the left-hand branch corresponds to samples where the index value is less than the cutoff, while the right-hand branch to samples where it is equal to or higher than the cutoff.
+
+To evaluate the predictive performance of this simple decision tree, we compute MAE and RMSE on the test set.
+
+```{r}
+complete.tree.preds <- loginv(predict(complete.tree, fires.test))
+
+print(data.frame(
+  "MAE"=mae(fires.test$area, complete.tree.preds),
+  "RMSE"=rmse(fires.test$area, complete.tree.preds),
+  row.names=c("complete.tree")
+))
+```
+
+This decision tree does not do well on our test set. In fact, it yields a higher MAE than our best linear model. In an attempt to achieve better performance, we introduce random forests in the next section.
+
+## Random forest
+One of the main drawbacks of simple decision trees is that they suffer from high variance. This means that, given another sample from our population of interest, the resulting tree may be very different to the one we have seen previously. To alleviate this problem, we can apply *bagging* (or *bootstrap aggregation*), at the expense of interpretability.
+
+In order to reduce variance, we may sample multiple training sets from our population, build a model per training set, and then average the predictions from every model to obtain a single prediction for a given observation. However, since we do not have access to multiple training sets (and our available data is scarce as it is), we can instead bootstrap by taking repeated samples with replacement from our only training set.
+
+This way, we generate $B$ bootstrapped training sets of size $n$, each of which makes use of approximately two-thirds of the observations from the original training data. Finally, we build $B$ regression trees using the bootstrapped training sets. These trees are weak learners with high variance and low bias. When combined, they produce a strong learner which predicts new observations by averaging the predictions of every weak learner. Therefore, the strong learner has lower variance.
+
+A *random forest* takes the idea of bagging a step further, by applying a procedure that *decorrelates* the trees. More specifically, when building a tree, only a limited number of predictors is considered at each split. For regression, this number is typically set to $m=p/3$. Thus, at each split of each tree, we randomly choose only a subset of our predictors, and only consider those to evaluate possible splits. This effectively forces the trees to use different predictors, rather than choosing the strongest predictors most of the time. Therefore, the predictions from these trees are less correlated, leading to a larger reduction in variance.
+
+The following code fits a random forest with 500 trees and 4 predictors sampled for splitting at each node.
+
+```{r}
+set.seed(42)  # For reproducibility
+
+default.rf <- ranger(
+  log(area+1) ~ X + Y + month + isweekend + FFMC + DMC + DC + ISI + temp + RH + wind,
+  data=fires,
+  num.trees=500,
+  mtry=4,
+  splitrule="variance",
+  max.depth=0
+)
+
+default.rf
+```
+
+The call output shows two important metrics, namely MSR and $R^2$. Note that both these metrics are not computed on training data, but rather on the *out-of-bag* (OOB) observations.
+
+As we mentioned, each bagged tree uses about two-thirds of the observations from the original training data. This means that any given tree does not see, on average, one-third of the observations. These are the OOB observations. Therefore, to get an estimate of the error on unseen data we can predict the response of the $i$-th observation from the training set by averaging the predictions of the trees for which the $i$-th observation was out-of-bag. These predictions can be used to compute OOB metrics, such as OOB MSR.
+
+The following plot shows the OOB MSR as a function of the number of trees fitted. Note that this error is directly computed on the transformed target.
+
+```{r}
+ntrees <- seq(1, 501, 5)
+oobmsr <- vector("numeric", length(ntrees))
+
+for (i in 1:length(ntrees)) {
+  current.rf <- ranger(
+    log(area+1) ~ X + Y + month + isweekend + FFMC + DMC + DC + ISI + temp + RH + wind,
+    data=fires,
+    num.trees=ntrees[i],
+    mtry=12/3,
+    splitrule="variance",
+    max.depth=0
+  )
+  
+  oobmsr[i] <- current.rf$prediction.error
+}
+
+ggplot(data=data.frame(ntrees=ntrees, oobmsr=oobmsr)) +
+  geom_line(mapping=aes(x=ntrees, y=oobmsr)) +
+  ylab("OOB MSR") +
+  xlab("number of trees") +
+  ggtitle("Random forest OOB MSR") +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+The graph shows that the OOB MSR reaches its minimum at around 200 trees, and remains stable thereafter.
+
+We now have a predictive model, which we can use to observe the training error. Thus, we compute MAE and RMSE on the training set. The inverse of the logarithm transformation is applied to the responses before computing these metrics.
+
+```{r}
+default.rf.preds <- loginv(predict(default.rf, fires)$predictions)
+print(data.frame(
+  "MAE"=mae(fires$area, default.rf.preds),
+  "RMSE"=rmse(fires$area, default.rf.preds),
+  row.names=c("default.rf")
+))
+```
+
+This random forest yields a training error lower than our best linear model. To visualize the magnitude of the errors on training data, we plot the predictions of our model against the ground truth.
+
+```{r, fig.width=9, fig.height=5, message=FALSE}
+rfdtrp <- ggplot(data=data.frame(truth=fires$area, preds=default.rf.preds)) +
+  geom_point(mapping=aes(x=truth, y=preds), alpha=point_alpha) +
+  geom_abline(mapping=aes(intercept=0, slope=1), color="black", linetype=2, size=1) +
+  coord_cartesian(xlim=c(0, 200), ylim=c(0, 200)) +
+  ggtitle("Training predictions") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+rfdtrp_zoom <- ggplot(data=data.frame(truth=fires$area, preds=default.rf.preds)) +
+  geom_point(mapping=aes(x=truth, y=preds), alpha=point_alpha) +
+  geom_abline(mapping=aes(intercept=0, slope=1), color="black", linetype=2, size=1) +
+  coord_cartesian(xlim=c(0, 40), ylim=c(0, 40)) +
+  ggtitle("Training predictions (zoomed)") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+plot_grid(rfdtrp, rfdtrp_zoom, nrow=1, ncol=2)
+```
+
+Our model appears to fit better to small fires, while it underestimates the magnitude of larger fires in a consistent manner. However, we suspect that these results may be due individual trees overfitting to training data, which translates to bad predictive performance on unseen samples. In fact, the default settings do not impose any restriction on the depth of trees grown in the forest.
+
+To select a better combination of parameters which may improve the generalization error, we consider the OOB MSR. Our main focus lies on choosing the optimal maximum depth of each tree and the optimal value of $m$.
+
+```{r}
+grid.results <- data.frame(matrix(ncol=3, nrow=0))
+colnames(grid.results) <- c("maxdepth", "mtry", "oobmsr")
+
+grid.maxdepth <- c(2, 3, 4, 5, 10, 20, 50)
+grid.mtry <- c(2:11)
+
+set.seed(123)
+
+for (md in grid.maxdepth) {
+  for (mt in grid.mtry) {
+    fit.rf <- ranger(
+      log(area+1) ~ X + Y + month + isweekend + FFMC + DMC + DC + ISI + temp + RH + wind,
+      data=fires,
+      num.trees=500,
+      mtry=mt,
+      max.depth=md,
+      splitrule="variance"
+    )
+
+    oobmsr <- tail(fit.rf$prediction.error, 1)
+
+    grid.results[nrow(grid.results)+1, ] = c(md, mt, oobmsr)
+  }
+}
+
+print(head(grid.results[order(grid.results$oobmsr, decreasing=F), ], n=10))
+```
+
+Only the top ten random forests with the lowest OOB MSR are shown. According to this metric, we obtain the best results if we limit maximum tree depth to 2 and consider only 3 predictors at each split.
+
+```{r}
+set.seed(11)
+
+best.rf <- ranger(
+  log(area+1) ~ X + Y + month + isweekend + FFMC + DMC + DC + ISI + temp + RH + wind,
+  data=fires,
+  num.trees=500,
+  mtry=3,
+  max.depth=2,
+  splitrule="variance"
+)
+
+best.rf.preds <- loginv(predict(best.rf, fires)$predictions)
+
+print(data.frame(
+  "MAE"=mae(fires$area, best.rf.preds),
+  "RMSE"=rmse(fires$area, best.rf.preds),
+  row.names=c("best.rf")
+))
+```
+
+The MAE and RMSE on training data are up again, which suggests that the random forest is not overfitting to training data.
+
+To wrap up, we compute MAE and RMSE and show a plot of predictions against true values on our test data.
+
+```{r}
+best.rf.test.preds <- loginv(predict(best.rf, fires.test)$predictions)
+print(data.frame(
+  "MAE"=mae(fires.test$area, best.rf.test.preds),
+  "RMSE"=rmse(fires.test$area, best.rf.test.preds),
+  row.names=c("best.rf")
+))
+```
+
+The test results are comparable to those obtained by our linear regression model, albeit slightly better.
+
+```{r, fig.width=9, fig.height=5, message=FALSE}
+rftep <- ggplot(data=data.frame(truth=fires.test$area, preds=best.rf.test.preds)) +
+  geom_point(mapping=aes(x=truth, y=preds), alpha=point_alpha) +
+  geom_abline(mapping=aes(intercept=0, slope=1), color="black", linetype=2, size=1) +
+  coord_cartesian(xlim=c(0, 200), ylim=c(0, 200)) +
+  ggtitle("Test predictions") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+rftep_zoom <- ggplot(data=data.frame(truth=fires.test$area, preds=best.rf.test.preds)) +
+  geom_point(mapping=aes(x=truth, y=preds), alpha=point_alpha) +
+  geom_abline(mapping=aes(intercept=0, slope=1), color="black", linetype=2, size=1) +
+  coord_cartesian(xlim=c(0, 40), ylim=c(0, 40)) +
+  ggtitle("Test predictions (zoomed)") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+plot_grid(rftep, rftep_zoom, nrow=1, ncol=2)
+```
+
+Unfortunately, our random forest appears to consistently underestimate the area burned by forest fires, as larger fires go undetected. This model is not able to reliably predict the response based on the predictors at our disposal.
+
+# Random forest classification
+Finally, we move back to the binary classification problem of predicting whether the fire is small or large, given a set of observations. Our goal is to apply a random forest classification model and compare its performance to that of logistic regression.
+
+## Theoretical framework
+In the context of classification, decision trees are built via recursive binary splitting, albeit with a different metric for choosing the best split among the various possibilities.
+
+In particular, we use the *Gini index* to evaluate the quality of candidate splits. The higher the Gini index associated to a node, the higher the impurity of that node. Our goal is to find splits that minimize the impurity of child nodes. 
+
+The Gini index for a given node $t$ is defined as $\text{Gini}(t) = 1 - \sum_c f(c|t)^2$, where $f(c|t)$ is the relative frequency of class $c$ at node $t$.
+
+The prediction for the $j$-th region is the most frequently occurring class among the training samples that fall inside the region.
+
+## Random forest
+As a first attempt, we fit a random forest classifier on our training data with 500 trees and 4 predictors to evaluate at each split.
+```{r}
+set.seed(42)  # For reproducibility
+
+default.clf.rf <- ranger(
+  areabinary ~ X + Y + month + isweekend + FFMC + DMC + DC + ISI + temp + RH + wind,
+  data=fires,
+  num.trees=500,
+  mtry=4,
+  max.depth=0
+)
+
+default.clf.rf
+```
+
+We are now considering a classification problem, therefore the call output shows the OOB prediction error instead of the OOB MSR and $R^2$.
+
+The OOB prediction error shows promising results, given this is a difficult classification task. We perform a grid search to choose the optimal combination of maximum tree depth and number of predictors to consider at each split $m$, such that the estimated generalization error is the lowest.
+
+```{r}
+grid.results <- data.frame(matrix(ncol=3, nrow=0))
+colnames(grid.results) <- c("maxdepth", "mtry", "ooberror")
+
+grid.maxdepth <- c(2, 3, 4, 5, 10, 20, 50, 100)
+grid.mtry <- c(2:11)
+
+set.seed(123)
+
+for (md in grid.maxdepth) {
+  for (mt in grid.mtry) {
+    fit.rf <- ranger(
+      areabinary ~ X + Y + month + isweekend + FFMC + DMC + DC + ISI + temp + RH + wind,
+      data=fires,
+      num.trees=500,
+      mtry=mt,
+      max.depth=md,
+    )
+
+    ooberror <- tail(fit.rf$prediction.error, 1)
+
+    grid.results[nrow(grid.results)+1, ] = c(md, mt, ooberror)
+  }
+}
+
+print(head(grid.results[order(grid.results$ooberror, decreasing=F), ], n=10))
+```
+
+According to these results, we have three different combinations which yield the same lowest OOB prediction error. The typical choice of $m$ for classification tasks is $\sqrt{p}$ which, in our case, is around 3. Therefore, we choose to fit a random forest classifier with $m$ equal to 3 and maximum tree depth equal to 50 and evaluate its performance on test data.
+
+```{r}
+set.seed(69)
+
+best.clf.rf <- ranger(
+  areabinary ~ X + Y + month + isweekend + FFMC + DMC + DC + ISI + temp + RH + wind,
+  data=fires,
+  num.trees=500,
+  mtry=3,
+  max.depth=50
+)
+
+best.clf.rf.test.preds <- predict(best.clf.rf, fires.test)$predictions
+  
+cm <- confusionMatrix(best.clf.rf.test.preds, fires.test$areabinary)
+print(cm$table)
+print(cm$overall["Accuracy"])
+```
+
+The results on the test set show that a random forest is more capable of modeling the relationship between the predictors and the size of the fire, compared to our logistic regression model. However, more advanced methods may be required to further increase predictive performance.
+
+# Conclusion
+In this work, we attempt to predict the burned area of forest fires with weather data. Using this kind of data is advantageous, as it can be collected in real time and at a lower cost with respect to other techniques.
+
+Firstly, we build and evaluate several linear regression models, reaching mediocre results. Then, we solve a simplified version of the problem, namely predicting whether a forest fire is bigger or smaller than a given threshold, by employing a logistic regression model. We go back to the original regression problem and adopt a non-linear model, a random forest, and compare its performance to that of linear models. Finally, we build a random forest classifier to solve the simplified binary classification task and compare it to the logistic regression model.
+
+Unfortunately, our models are not able to predict the area burned by forest fires in a satisfactory manner using the data at our disposal. This is a difficult regression task, and more advanced techniques may be necessary to build useful predictive models. Moreover, as highlighted by @cortez, additional information is required, such as the type of vegetation and firefighting intervention, which is not included in this dataset.
+
+Nonetheless, the linear models are able to give some useful insights on the relationship between predictors and response. They are especially useful to understand what are the variables that influence the area of forest fires, and to estimate how much they affect the response.
+
+# References
